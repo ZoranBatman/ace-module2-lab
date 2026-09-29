@@ -21,6 +21,73 @@ function favicon () {
   return utils.extractFilename(config.get('application.favicon'))
 }
 
+function evaluateMathExpression (expr: string): number | null {
+  const tokens = expr.match(/\d+(?:\.\d+)?|[+\-*/%()]/g)
+  if (!tokens || tokens.join('').replace(/\s/g, '') !== expr.replace(/\s/g, '')) {
+    return null
+  }
+  let pos = 0
+  function parsePrimary (): number {
+    const token = tokens![pos++]
+    if (token === '(') {
+      const val = parseAddSub()
+      if (tokens![pos++] !== ')') throw new Error('Mismatched paren')
+      return val
+    }
+    if (token === '-' || token === '+') {
+      const val = parsePrimary()
+      return token === '-' ? -val : val
+    }
+    const num = Number(token)
+    if (Number.isNaN(num)) throw new Error('Invalid number')
+    return num
+  }
+  function parseMulDiv (): number {
+    let left = parsePrimary()
+    while (pos < tokens!.length && (tokens![pos] === '*' || tokens![pos] === '/' || tokens![pos] === '%')) {
+      const op = tokens![pos++]
+      const right = parsePrimary()
+      if (op === '*') left *= right
+      else if (op === '/') {
+        if (right === 0) throw new Error('Division by zero')
+        left /= right
+      } else {
+        if (right === 0) throw new Error('Modulo by zero')
+        left %= right
+      }
+    }
+    return left
+  }
+  function parseAddSub (): number {
+    let left = parseMulDiv()
+    while (pos < tokens!.length && (tokens![pos] === '+' || tokens![pos] === '-')) {
+      const op = tokens![pos++]
+      const right = parseMulDiv()
+      if (op === '+') left += right
+      else left -= right
+    }
+    return left
+  }
+  try {
+    const result = parseAddSub()
+    if (pos !== tokens.length || !Number.isFinite(result)) return null
+    return result
+  } catch {
+    return null
+  }
+}
+
+function sanitizeUsername (name: string): string {
+  const noNewlines = name.replace(/[\r\n]/g, '')
+  const encoded = entities.encode(noNewlines)
+  return encoded.replace(/#{/g, '\\#{')
+}
+
+function isSafeImageSource (image?: string): boolean {
+  if (!image) return false
+  return !/[;\r\n\s'"<>]/.test(image)
+}
+
 export function getUserProfile () {
   return async (req: Request, res: Response, next: NextFunction) => {
     let template: string
@@ -58,34 +125,23 @@ export function getUserProfile () {
         if (!code) {
           throw new Error('Username is null')
         }
-        const singleQuoteRegex = /^'(?:[^'\\]|\\.)*'$/
-        const doubleQuoteRegex = /^"(?:[^"\\]|\\.)*"$/
-        const backtickRegex = /^`(?:[^`\\$]|\\.|\$(?!{))*`$/
-        const numericRegex = /^-?\d+(?:\.\d+)?$/
-        const booleanRegex = /^(?:true|false|null|undefined)$/
-
-        const isSafe = singleQuoteRegex.test(code) ||
-          doubleQuoteRegex.test(code) ||
-          backtickRegex.test(code) ||
-          numericRegex.test(code) ||
-          booleanRegex.test(code)
-
-        if (!isSafe) {
+        const mathResult = evaluateMathExpression(code)
+        if (mathResult === null) {
           throw new Error('Unsafe code execution blocked')
         }
-        username = eval(code) // eslint-disable-line no-eval
+        username = String(mathResult)
       } catch (err) {
-        username = '\\' + username
+        username = sanitizeUsername(user.username ?? '')
       }
     } else {
-      username = '\\' + username
+      username = sanitizeUsername(user.username ?? '')
     }
 
     const themeKey = config.get<string>('application.theme') as keyof typeof themes
     const theme = themes[themeKey] || themes['bluegrey-lightgreen']
 
     if (username) {
-      template = template.replace(/_username_/g, username)
+      template = template.replace(/_username_/g, () => username)
     }
     template = template.replace(/_emailHash_/g, security.hash(user?.email))
     template = template.replace(/_title_/g, entities.encode(config.get<string>('application.name')))
@@ -100,10 +156,11 @@ export function getUserProfile () {
     try {
       const pug = (await import('pug')).default
       const fn = pug.compile(template)
-      const CSP = `img-src 'self' ${user?.profileImage}; script-src 'self' 'unsafe-eval'`
+      const imageSource = isSafeImageSource(user?.profileImage) ? ` ${user?.profileImage}` : ''
+      const CSP = `img-src 'self'${imageSource}; script-src 'self' 'unsafe-eval'`
 
       challengeUtils.solveIf(challenges.usernameXssChallenge, () => {
-        return username && user?.profileImage.match(/;[ ]*script-src(.)*'unsafe-inline'/g) !== null && utils.contains(username, '<script>alert(`xss`)</script>')
+        return Boolean(username && user?.profileImage?.match(/;[ ]*script-src(.)*'unsafe-inline'/g) !== null && utils.contains(username, '<script>alert(`xss`)</script>'))
       })
 
       res.set({
